@@ -1,0 +1,5 @@
+bin/
+*.o
+__pycache__/
+.DS_Store
+results/*.tmp

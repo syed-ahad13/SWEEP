@@ -1,0 +1,9 @@
+{
+  "_comment": "Achieved copy-bandwidth bands (GB/s) a healthy card must land in. Measured, not datasheet: a host outside its band is throttled, shared, or not the card it claims to be -- destroy it. Key is the gpu_key emitted by scripts/provenance.sh.",
+  "RTX_4090":   { "expected_gbps": [850, 950] },
+  "Tesla_T4":   { "expected_gbps": [220, 270] },
+  "Tesla_P100": { "expected_gbps": [500, 580] },
+  "A100_80GB":  { "expected_gbps": [1500, 1800] },
+  "RTX_5090":   { "expected_gbps": [1450, 1700] },
+  "RTX_3090":   { "expected_gbps": [800, 900] }
+}
