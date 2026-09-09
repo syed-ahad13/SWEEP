@@ -14,7 +14,7 @@ set -euo pipefail
 REPO_OWNER="syed-ahad13"
 REPO_NAME="SWEEP"
 GIT_USER_NAME="Ahad"
-GIT_USER_EMAIL="syed-ahad13@users.noreply.github.com"
+GIT_USER_EMAIL="abdulahad17100@gmail.com"
 
 if [ -z "${GH_TOKEN:-}" ]; then
   echo "pod_init.sh: GH_TOKEN is not set. export it first (it is never stored on disk)." >&2
