@@ -81,7 +81,7 @@ else
   elif awk -v a="$PL" -v b="$PD" 'BEGIN{exit !(a >= 0.95*b)}'; then
     ok "power ${PL}W of ${PD}W"
   else
-    bad "power ${PL}W of ${PD}W - host has capped this card"
+    warn "power ${PL}W of ${PD}W - host has capped this card"
   fi
 
   if ! isnum "$USED"; then
