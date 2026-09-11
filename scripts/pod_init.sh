@@ -1,75 +1,104 @@
 #!/usr/bin/env bash
-# First command on a freshly rented pod.
-#
-#   export GH_TOKEN=<fine-grained token>   # env var only; never written to a file
-#   bash pod_init.sh && cd /workspace/SWEEP
-#
-# GH_TOKEN is read from the environment by a credential helper at each git
-# operation. It never enters a remote URL, .git/config, or argv.
-set -euo pipefail
+# Host gate. Run by the template's on-start script; safe to re-run by hand:
+#     bash /workspace/SWEEP/scripts/pod_init.sh
+# Writes its own verdict to /root/init.status, so a manual re-run refreshes
+# the login banner instead of leaving a stale FAIL on screen.
+set -uo pipefail
 
 REPO_OWNER="syed-ahad13"
 REPO_NAME="SWEEP"
-WORK_ROOT="${WORK_ROOT:-/workspace}"
 GIT_USER_NAME="Ahad"
 GIT_USER_EMAIL="abdulahad17100@gmail.com"
+WORK_ROOT="${WORK_ROOT:-/workspace}"
+MIN_CUDA_MAJ=12
+MIN_CUDA_MIN=8
 
-die() { echo "pod_init.sh: $*" >&2; exit 1; }
-[ -n "${GH_TOKEN:-}" ] || die "GH_TOKEN is not set. export it first (it is never stored on disk)."
+STATUS=/root/init.status
 [ -d "$WORK_ROOT" ] || WORK_ROOT="$HOME"
 REPO_DIR="$WORK_ROOT/$REPO_NAME"
-[ -n "${TMUX:-}" ] || echo "pod_init.sh: WARNING - not inside tmux; an SSH drop kills whatever is running."
-
 export GIT_TERMINAL_PROMPT=0
-git config --global credential."https://github.com".helper \
-  '!f() { test "$1" = get && printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f'
 
+FAIL=0; WARN=0
+ok()   { echo "[ok]   $*"; }
+warn() { WARN=$((WARN+1)); echo "[warn] $*"; }
+bad()  { FAIL=$((FAIL+1)); echo "[FAIL] $*"; }
+isnum(){ [ -n "${1:-}" ] && printf '%s' "$1" | grep -Eq '^[0-9]+([.][0-9]+)?$'; }
+verdict() {
+  if [ "$FAIL" -eq 0 ]; then
+    echo "GATE PASS ($WARN warn) - $(date -u +%FT%TZ)" | tee "$STATUS"
+    exit 0
+  fi
+  echo "GATE FAIL ($FAIL fail, $WARN warn) - destroy this instance (see /root/init.log)" | tee "$STATUS"
+  exit 1
+}
+
+# --- repo -------------------------------------------------------------------
 if [ -d "$REPO_DIR/.git" ]; then
-  echo "pod_init.sh: $REPO_DIR already cloned; fetching."
-  git -C "$REPO_DIR" fetch --quiet --prune
+  git -C "$REPO_DIR" fetch --quiet --prune 2>/dev/null || warn "git fetch failed (token expired?)"
+elif [ -n "${GH_TOKEN:-}" ]; then
+  git clone --quiet "https://github.com/$REPO_OWNER/$REPO_NAME.git" "$REPO_DIR" \
+    && ok "repo cloned" || bad "clone failed - check the token's Contents permission"
 else
-  git clone --quiet "https://github.com/${REPO_OWNER}/${REPO_NAME}.git" "$REPO_DIR"
+  bad "no repo and no GH_TOKEN"
+fi
+if cd "$REPO_DIR" 2>/dev/null; then
+  git config user.name "$GIT_USER_NAME"
+  git config user.email "$GIT_USER_EMAIL"
 fi
 
-cd "$REPO_DIR"
-git config user.name  "$GIT_USER_NAME"
-git config user.email "$GIT_USER_EMAIL"
-
-FAIL=0
-
+# --- gate 1: toolkit --------------------------------------------------------
 echo
 echo "=== toolkit ==="
-if command -v nvcc >/dev/null 2>&1; then
-  nvcc --version | sed -n '/release/p'
+NVCC="$(command -v nvcc || true)"
+[ -n "$NVCC" ] || [ ! -x /usr/local/cuda/bin/nvcc ] || NVCC=/usr/local/cuda/bin/nvcc
+if [ -z "$NVCC" ]; then
+  bad "nvcc not found on PATH or at /usr/local/cuda/bin - runtime-only image?"
 else
-  echo "nvcc: MISSING - runtime-only image. Destroy and rent a *-devel image."
-  FAIL=1
+  REL=$("$NVCC" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p')
+  # shellcheck disable=SC2086
+  set -- $REL
+  MAJ="${1:-0}"; MIN="${2:-0}"
+  if [ $((MAJ * 100 + MIN)) -ge $((MIN_CUDA_MAJ * 100 + MIN_CUDA_MIN)) ]; then
+    ok "nvcc $MAJ.$MIN at $NVCC"
+  else
+    bad "nvcc $MAJ.$MIN is older than $MIN_CUDA_MAJ.$MIN_CUDA_MIN"
+  fi
 fi
 
+# --- gate 2: the card -------------------------------------------------------
 echo
 echo "=== card ==="
-if command -v nvidia-smi >/dev/null 2>&1; then
-  nvidia-smi --query-gpu=name,compute_cap,driver_version,power.limit,power.default_limit \
-    --format=csv
-  PL="$(nvidia-smi --query-gpu=power.limit         --format=csv,noheader,nounits | head -1 | tr -d ' ')"
-  PD="$(nvidia-smi --query-gpu=power.default_limit --format=csv,noheader,nounits | head -1 | tr -d ' ')"
-  if awk -v a="$PL" -v b="$PD" 'BEGIN{exit !(b>0 && a >= 0.95*b)}'; then
-    echo "power: ${PL}W of ${PD}W default - OK"
-  else
-    echo "power: ${PL}W of ${PD}W default - host has capped this card; every bandwidth number will be low."
-    FAIL=1
-  fi
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  bad "nvidia-smi missing - not a GPU host"
 else
-  echo "nvidia-smi: MISSING - not a GPU host."
-  FAIL=1
+  nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total,power.limit,power.default_limit \
+    --format=csv 2>/dev/null | sed 's/^/  /'
+  q() { nvidia-smi --query-gpu="$1" --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '; }
+  PL=$(q power.limit); PD=$(q power.default_limit); USED=$(q memory.used); CC=$(q compute_cap)
+
+  if ! isnum "$PL" || ! isnum "$PD" || [ "${PD%%.*}" -eq 0 ] 2>/dev/null; then
+    warn "power limit unreadable (PL='$PL' PD='$PD') - cannot verify the card is uncapped"
+  elif awk -v a="$PL" -v b="$PD" 'BEGIN{exit !(a >= 0.95*b)}'; then
+    ok "power ${PL}W of ${PD}W"
+  else
+    bad "power ${PL}W of ${PD}W - host has capped this card"
+  fi
+
+  if ! isnum "$USED"; then
+    warn "memory.used unreadable"
+  elif awk -v u="$USED" 'BEGIN{exit !(u < 512)}'; then
+    ok "vram ${USED} MiB in use"
+  else
+    bad "vram ${USED} MiB already allocated - shared card or leaked context"
+  fi
+
+  [ "$CC" = "8.9" ] && ok "compute_cap 8.9 (Ada)" || warn "compute_cap $CC - not the RTX 4090 you gated for"
 fi
 
+# --- next -------------------------------------------------------------------
 echo
-git status -sb
-echo "Repo at $REPO_DIR on $(git rev-parse --abbrev-ref HEAD) @ $(git rev-parse --short HEAD)"
-echo "Run:  cd $REPO_DIR"
-echo "Remaining gate:"
-echo "  make bin/bw_probe ARCH=<sm_XX> && ./bin/bw_probe  -> inside the band in results/machines.json"
-echo "Any gate red: destroy this instance and take the next offer."
-
-[ "$FAIL" -eq 0 ] || die "host gate FAILED - destroy this instance."
+if [ -d "$REPO_DIR/.git" ]; then
+  git -C "$REPO_DIR" status -sb | head -3
+  echo "repo: $REPO_DIR @ $(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null)"
+fi
+verdict
